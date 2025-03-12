@@ -1,0 +1,377 @@
+# --------------------------------------------------------
+# Original Code from BEIT: BERT Pre-Training of Image Transformers (https://arxiv.org/abs/2106.08254)
+# Github source: https://github.com/microsoft/unilm/tree/master/beit
+# Modified for implementation of Masked Image Modeling with Denoising Contrast(https://arxiv.org/abs/2205.09616)
+# By Kun Yi
+# --------------------------------------------------------
+import argparse
+import datetime
+import numpy as np
+import time
+import torch
+import torch.backends.cudnn as cudnn
+import json
+import os
+import copy
+
+from pathlib import Path
+
+from timm.models import create_model
+from optim_factory import create_optimizer
+
+from datasets import build_conmim_pretraining_dataset
+from engine_for_pretraining import train_one_epoch
+from utils import NativeScalerWithGradNormCount as NativeScaler
+import utils
+import modeling_pretrain
+
+from datasets import get_dataset, HyperX
+
+
+from sklearn.preprocessing import scale, minmax_scale, normalize
+from skimage.segmentation import slic, mark_boundaries, find_boundaries
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
+from datasets import HSI_to_superpixels
+
+
+def get_args():
+    parser = argparse.ArgumentParser('ConMIM pre-training script', add_help=False)
+    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--save_ckpt_freq', default=20, type=int)
+    parser.add_argument("--discrete_vae_weight_path", type=str)
+    parser.add_argument("--discrete_vae_type", type=str, default="dall-e") 
+    
+    # Model parameters
+    parser.add_argument('--model', default='conmim_small_patch_3', type=str, metavar='MODEL',
+                        help='Name of model to train')
+    parser.add_argument('--rel_pos_bias', action='store_true')        
+    parser.add_argument('--disable_rel_pos_bias', action='store_false', dest='rel_pos_bias')   
+    parser.set_defaults(rel_pos_bias=False)                             
+    parser.add_argument('--abs_pos_emb', action='store_true')       
+    parser.set_defaults(abs_pos_emb=True)                          
+    parser.add_argument('--layer_scale_init_value', default=0.1, type=float, 
+                        help="0.1 for base, 1e-5 for large. set 0 to disable layer scale")  
+    parser.add_argument('--temp', default=0.1, type=float)             
+    parser.add_argument('--max_mask_patches_per_block', type=int, default=None) 
+    parser.add_argument('--min_mask_patches_per_block', type=int, default=16)  
+    parser.add_argument('--mask_ratio', default=0.75, type=float,              
+                        help='ratio of the visual tokens/patches need be masked')
+    parser.add_argument("--mask_type", type=str, default="random_mps32")       
+    parser.add_argument('--drop_path', type=float, default=0, metavar='PCT',   
+                        help='Drop path rate (default: 0)')
+
+    # Optimizer parameters
+    parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
+                        help='Optimizer (default: "adamw"')
+    parser.add_argument('--opt_eps', default=1e-8, type=float, metavar='EPSILON',
+                        help='Optimizer Epsilon (default: 1e-8)')
+    parser.add_argument('--opt_betas', default=[0.9, 0.98], type=float, nargs='+', metavar='BETA',
+                        help='Optimizer Betas (default: 0.9, 0.98, use opt default)')
+    parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
+                        help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='weight decay (default: 0.05)')
+    parser.add_argument('--weight_decay_end', type=float, default=None, help="""Final value of the
+        weight decay. We use a cosine schedule for WD. 
+        (Set the same value with args.weight_decay to keep weight decay no change)""")
+
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
+                        help='learning rate (default: 5e-4)')
+    parser.add_argument('--warmup_lr', type=float, default=1e-6, metavar='LR',
+                        help='warmup learning rate (default: 1e-6)')
+    parser.add_argument('--min_lr', type=float, default=1e-5, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+
+    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N',
+                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_argument('--no_loss_masked', action='store_true')
+    parser.add_argument('--t_momentum', type=float, default=0.996, metavar='M',
+                        help='teacher momentum (default: 0.996)')
+
+    # Augmentation parameters
+    parser.add_argument('--train_interpolation', type=str, default='bicubic',
+                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+    parser.add_argument('--second_interpolation', type=str, default='lanczos',
+                        help='Interpolation for discrete vae (random, bilinear, bicubic default: "lanczos")')
+
+    # Dataset parameters
+    parser.add_argument('--imagenet_default_mean_and_std', default=False, action='store_true')
+    parser.add_argument('--output_dir', default='./output/conmim_pretrained111',
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--log_dir', default=None,
+                        help='path where to tensorboard log')
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+    parser.add_argument('--seed', default=0, type=int)                                         
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume_copy', default='', help='resume from checkpoint')
+    parser.add_argument('--auto_resume', action='store_true')
+    parser.add_argument('--no_auto_resume', action='store_false', dest='auto_resume')
+    parser.set_defaults(auto_resume=True)
+
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
+    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--pin_mem', action='store_true',
+                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem',
+                        help='')
+    parser.set_defaults(pin_mem=True)
+
+    # distributed training parameters
+    parser.add_argument('--world_size', default=1, type=int,        
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)          
+    parser.add_argument('--dist_on_itp', action='store_true')        
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
+    # 高光谱上的参数
+    parser.add_argument('--dataset', type=str, default='IndianPines',)
+    
+    parser.add_argument('--folder', type=str, default='../dataset/',
+                    help="Folder where to store the "
+                         "datasets (defaults to the current working directory).")
+    
+    parser.add_argument('--patch_size', default=11, type=int)
+    
+    group_dataset = parser.add_argument_group('Dataset')
+    group_dataset.add_argument('--sampling_mode', type=str, default='random',
+                           help="Sampling mode (random sampling or disjoint, default:  fixed)")
+    group_dataset.add_argument('--training_percentage', type=float, default=0.1,
+                           help="Percentage of samples to use for training")
+    group_dataset.add_argument('--train_gt', action='store_true',
+                           help="Samples use of training")
+    group_dataset.add_argument('--test_gt', action='store_true',
+                           help="Samples use of testing")
+    group_dataset.add_argument('--load_data', type=str, default=None,
+                           help="Samples use of training")          
+    group_train = parser.add_argument_group('Training')
+    group_train.add_argument('--class_balancing', action='store_true',
+                         help="Inverse median frequency class balancing (default = False)")
+    parser.add_argument('--depth', default=3, type=int)
+    parser.add_argument('--alpha', default=0.5, type=float)     
+    parser.add_argument('--gamma', default=0.5, type=float)
+    parser.add_argument('--mlp_dim', default=200, type=int)
+
+    parser.add_argument('--num_superpixel', default=100, type=int) 
+    parser.add_argument('--superpixel_pca_dim', default=10, type=int)
+    parser.add_argument('--path_to_sp', type=str, default=None) 
+    parser.add_argument('--superpixel_pca', action='store_true')
+    parser.set_defaults(superpixel_pca=False)
+    parser.add_argument('--is_superpixel', action='store_true')
+    parser.set_defaults(is_superpixel=True)
+
+    return parser.parse_args()
+
+
+def get_model(args,hyperspetral): 
+    print(f"Creating model: {args.model}")
+    model = create_model(                          
+        args.model,
+        patch_size=hyperspetral['patch_size'],
+        pretrained=False,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+        use_rel_pos_bias=args.rel_pos_bias,
+        use_abs_pos_emb=args.abs_pos_emb,
+        init_values=args.layer_scale_init_value,    
+        use_mlp_projectors = True,     
+        n_bands=hyperspetral['n_bands'],
+        depth=hyperspetral['depth'],
+        mlp_dim=hyperspetral['mlp_dim']
+    )       
+
+    return model
+
+
+def main(args):
+    utils.init_distributed_mode(args)
+
+    device = torch.device(args.device)
+
+    # fix the seed for reproducibility
+    seed = args.seed + utils.get_rank()     
+    torch.manual_seed(seed)                 
+    np.random.seed(seed)                    
+    cudnn.benchmark = True                  
+
+    # hyperspectral
+    DATASET = args.dataset
+    FOLDER = args.folder
+    TRAINING_PERCENTAGE = args.training_percentage
+    SAMPLING_MODE = args.sampling_mode
+    LOAD_DATA = args.load_data
+    hyperparams = vars(args)
+        
+    img, gt, LABEL_VALUES, IGNORED_LABELS = get_dataset(DATASET, FOLDER)
+    
+    N_BANDS = img.shape[-1]
+    N_CLASSES = len(LABEL_VALUES)
+
+    hyperparams.update(
+        {'n_classes': N_CLASSES, 'n_bands': N_BANDS, 'ignored_labels': IGNORED_LABELS, 'supervision':'full', 'center_pixel':True})
+    print("input hyperparams:",hyperparams)
+    hyperparams = dict((k, v) for k, v in hyperparams.items() if v is not None)
+    print("hyperparams:",hyperparams)
+
+    superpixel_img = img.astype(np.double)
+    num_superpixel = args.num_superpixel
+    path_to_sp = args.path_to_sp
+    superpixel_pca_dim = args.superpixel_pca_dim
+    n_row, n_column, n_band = superpixel_img.shape
+    if args.superpixel_pca:
+        superpixel_img = scale(superpixel_img.reshape(n_row * n_column, -1)) 
+        pca = PCA(n_components=superpixel_pca_dim)
+        superpixel_img = pca.fit_transform(superpixel_img).reshape((n_row, n_column, -1))
+    if args.is_superpixel:
+        if path_to_sp is not None: 
+            sp_labels = loadmat(path_to_sp)['labels']
+        else:
+            sp_labels = HSI_to_superpixels(superpixel_img, num_superpixel=num_superpixel, is_pca=False,
+                                                is_show_superpixel=False)
+    
+
+    model = get_model(args,hyperparams)
+    model_copy = get_model(args,hyperparams)
+
+    if LOAD_DATA:
+            train_gt_file = '../dataset/' + DATASET + '/' + LOAD_DATA + '/train_gt.npy'
+            train_gt = np.load(train_gt_file, 'r')
+    else: 
+        train_gt = gt
+    
+
+    # get dataset
+    dataset_train = HyperX(img, train_gt, sp_labels, **hyperparams)
+
+
+    if args.distributed:
+        num_tasks = utils.get_world_size()
+        global_rank = utils.get_rank()
+        sampler_rank = global_rank
+        num_training_steps_per_epoch = len(dataset_train) // args.batch_size // num_tasks
+
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
+        )
+        print("Sampler_train = %s" % str(sampler_train))
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+
+    if global_rank == 0 and args.log_dir is not None:
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
+    else:
+        log_writer = None
+
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+    )
+
+    model.to(device)
+    model_copy.to(device)
+    model_without_ddp = model
+    model_copy_without_ddp = model_copy
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print("Model = %s" % str(model_without_ddp))
+    print('number of params:', n_parameters)
+
+    total_batch_size = args.batch_size * utils.get_world_size()
+    print("LR = %.8f" % args.lr)
+    print("Batch size = %d" % total_batch_size)
+    print("Number of training steps = %d" % num_training_steps_per_epoch)
+    print("Number of training examples per epoch = %d" % (total_batch_size * num_training_steps_per_epoch))
+
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model_copy = torch.nn.parallel.DistributedDataParallel(model_copy, device_ids=[args.gpu], find_unused_parameters=True)
+
+        model_without_ddp = model.module
+        model_copy_without_ddp = model_copy.module
+
+    model_copy_without_ddp.load_state_dict(model.state_dict(), strict=False)
+    # there is no backpropagation through the teacher, so no need for gradients
+    for p in model_copy_without_ddp.parameters():
+        p.requires_grad = False
+
+    optimizer = create_optimizer(
+        args, model_without_ddp)
+    loss_scaler = NativeScaler()
+
+    print("Use step level LR & WD scheduler!")
+    lr_schedule_values = utils.cosine_scheduler(
+        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+        warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
+    )
+    if args.weight_decay_end is None:
+        args.weight_decay_end = args.weight_decay
+    wd_schedule_values = utils.cosine_scheduler(
+        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+
+
+    utils.auto_load_model_copy(
+        args=args, model=model_copy, model_without_ddp=model_copy_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    utils.auto_load_model(
+        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+
+    print(f"Start training for {args.epochs} epochs")
+    start_time = time.time()
+
+    momentum_schedule = utils.cosine_scheduler(args.t_momentum, 1,
+                                            args.epochs, len(data_loader_train))
+
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
+        if log_writer is not None:
+            log_writer.set_step(epoch * num_training_steps_per_epoch)
+        train_stats = train_one_epoch(
+            model, data_loader_train, optimizer, device,
+            epoch, loss_scaler, momentum_schedule, model_copy,model_copy_without_ddp, args.temp,
+            args.clip_grad, log_writer=log_writer,
+            start_steps=epoch * num_training_steps_per_epoch,
+            lr_schedule_values=lr_schedule_values,
+            wd_schedule_values=wd_schedule_values,
+            alpha = args.alpha,
+            gamma = args.gamma,
+            maxsp_labels = sp_labels.max() + 1
+        )
+        if args.output_dir:
+            if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
+                utils.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch)
+
+
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     'epoch': epoch, 'n_parameters': n_parameters}
+
+        if args.output_dir and utils.is_main_process():
+            if log_writer is not None:
+                log_writer.flush()
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
+
+
+if __name__ == '__main__':
+    opts = get_args()
+    if opts.output_dir:
+        Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
+    main(opts)
