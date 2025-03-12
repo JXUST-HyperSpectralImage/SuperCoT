@@ -8,9 +8,3 @@ python run_conmim_pretraining.py \
             --mask_type 'random_mps32' --output_dir ./output/pretrain \
             --save_ckpt_freq 200
 
-python run_class_finetuning.py \
-                --finetune  \
-                --output_dir  \
-                --dataset IndianPines --batch_size 64 --patch_size 11 --lr 0.03 --update_freq 1 \
-                --warmup_epochs 10 --epochs 100 --layer_decay 0.65 --drop_path 0.1 \
-                --run 10 --weight_decay 0.05 --load_data 0.10
